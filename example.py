@@ -21,11 +21,13 @@ The default CIFAR10 model trained by this file should get
 
 Each epoch takes approximately 7m20s on a T4 GPU (will be much faster on V100 / A100).
 '''
+import lightning as L
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
-
+from lightning.pytorch.loggers import MLFlowLogger
 import torchvision
 import torchvision.transforms as transforms
 
@@ -35,6 +37,11 @@ import argparse
 from models.s4.s4 import S4Block as S4  # Can use full version instead of minimal S4D standalone below
 from models.s4.s4d import S4D
 from tqdm.auto import tqdm
+import mlflow
+
+mlflow.set_tracking_uri("http://isl-cpu1.rr.intel.com:2517/")
+#mlflow.create_experiment("check-localhost-connection")
+mlflow.pytorch.autolog(log_every_n_step=1)
 
 # Dropout broke in PyTorch 1.11
 if tuple(map(int, torch.__version__.split('.')[:2])) == (1, 11):
@@ -220,6 +227,68 @@ class S4Model(nn.Module):
 
         return x
 
+
+class LightningS4Model(L.LightningModule):
+    def __init__(self, model: nn.Module, lr: float, weight_decay: float, epochs: int):
+        super().__init__()
+        self.model = model
+        self.save_hyperparameters('lr', 'weight_decay', 'epochs')
+
+    def training_step(self, batch, batch_idx):
+        train_loss = 0
+        correct = 0
+        total = 0
+
+        inputs, targets = batch
+        outputs = self.model(inputs)
+        loss = F.cross_entropy(outputs, targets)
+        
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+        
+        #self.log_dict({'train_loss': loss, 'accuracy': 100.*correct/total})
+
+        return {"loss": loss}
+
+    def configure_optimizers(self):
+        all_parameters = list(self.model.parameters())
+
+        # General parameters don't contain the special _optim key
+        params = [p for p in all_parameters if not hasattr(p, "_optim")]
+
+        # Create an optimizer with the general parameters
+        optimizer = optim.AdamW(params, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+
+        # Add parameters with special hyperparameters
+        hps = [getattr(p, "_optim") for p in all_parameters if hasattr(p, "_optim")]
+        hps = [
+            dict(s) for s in sorted(list(dict.fromkeys(frozenset(hp.items()) for hp in hps)))
+        ]  # Unique dicts
+        for hp in hps:
+            params = [p for p in all_parameters if getattr(p, "_optim", None) == hp]
+            optimizer.add_param_group(
+                {"params": params, **hp}
+            )
+
+        # Create a lr scheduler
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=patience, factor=0.2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.epochs)
+
+        # Print optimizer info
+        keys = sorted(set([k for hp in hps for k in hp.keys()]))
+        for i, g in enumerate(optimizer.param_groups):
+            group_hps = {k: g.get(k, None) for k in keys}
+            print(' | '.join([
+                f"Optimizer group {i}",
+                f"{len(g['params'])} tensors",
+                ] + [f"{k} {v}" for k, v in group_hps.items()]))
+
+  
+        return [optimizer], [scheduler]
+
+
 # Model
 print('==> Building model..')
 model = S4Model(
@@ -230,10 +299,11 @@ model = S4Model(
     dropout=args.dropout,
     prenorm=args.prenorm,
 )
-
-model = model.to(device)
-if device == 'cuda':
-    cudnn.benchmark = True
+l_model = LightningS4Model(model, args.lr, args.weight_decay, args.epochs)
+#logger = MLFlowLogger(experiment_name="lightning_logs", tracking_uri="http://isl-cpu1.rr.intel.com:2517/")
+trainer = L.Trainer(max_epochs=args.epochs, )#logger=logger)
+trainer.fit(l_model, trainloader, None)
+exit()
 
 if args.resume:
     # Load checkpoint.
